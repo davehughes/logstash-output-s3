@@ -113,6 +113,16 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   # Specify a prefix to the uploaded filename, this can simulate directories on S3.  Prefix does not require leading slash.
   config :prefix, :validate => :string, :default => ''
 
+  # Specify a template for the full path of the uploaded S3 file.  `strftime` substitution works here and
+  # a number of other parameters are provided:
+  # * `file_prefix` => Hard-coded to 'ls.s3'
+  # * `file_extension` => Original tempfile extension, either '.txt' or '.txt.gz' for encoding => 'gzip'.
+  # * `tag` => Tags from the `tags` config field joined by '.'
+  # * `part_index` => Sequence value for the log file.
+  # * `temp_filename` => Original name of the temporary file where logs are stored prior to being uploaded.
+  # * `prefix` => Value of `prefix` config field.
+  config :s3_path_template, :validate => :string, :default => '%{prefix}%{temp_filename}'
+
   # Specify how many workers to use to upload the files to S3
   config :upload_workers_count, :validate => :number, :default => 1
 
@@ -162,12 +172,9 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   end
 
   public
-  def write_on_bucket(file)
+  def write_on_bucket(file, remote_filename)
     # find and use the bucket
     bucket = @s3.buckets[@bucket]
-
-    remote_filename = "#{@prefix}#{File.basename(file)}"
-
     @logger.debug("S3: ready to write file in bucket", :remote_filename => remote_filename, :bucket => @bucket)
 
     File.open(file, 'r') do |fileIO|
@@ -190,6 +197,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   # This method is used for create new empty temporary files for use. Flag is needed for indicate new subsection time_file.
   public
   def create_temporary_file
+
     filename = File.join(@temporary_directory, get_temporary_filename(@page_counter))
 
     @logger.debug("S3: Creating a new temporary file", :filename => filename)
@@ -219,6 +227,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     @s3 = aws_s3_config
     @upload_queue = Queue.new
     @file_rotation_lock = Mutex.new
+    @file_prefix = "ls.s3"
 
     if @prefix && @prefix =~ S3_INVALID_CHARACTERS
       @logger.error("S3: prefix contains invalid characters", :prefix => @prefix, :contains => S3_INVALID_CHARACTERS)
@@ -257,8 +266,9 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     end
 
     begin
-      write_on_bucket(test_filename)
-      delete_on_bucket(test_filename)
+      remote_filename = File.basename(test_filename)
+      write_on_bucket(test_filename, remote_filename)
+      delete_on_bucket(remote_filename)
     ensure
       File.delete(test_filename)
     end
@@ -278,7 +288,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   public
   def move_file_to_bucket(file)
     if !File.zero?(file)
-      write_on_bucket(file)
+      write_on_bucket(file, get_remote_filename(file))
       @logger.debug("S3: File was put on the upload thread", :filename => File.basename(file), :bucket => @bucket)
     end
 
@@ -305,18 +315,77 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   public
   def get_temporary_filename(page_counter = 0)
     current_time = Time.now
-    filename = "ls.s3.#{Socket.gethostname}.#{current_time.strftime("%Y-%m-%dT%H.%M")}"
+    return params_to_temp_filename({
+        :host => Socket.gethostname,
+        :timestamp => current_time,
+        :part_index => page_counter,
+        :file_prefix => @file_prefix,
+        :file_extension => get_tempfile_extension,
+        :tags => @tags.join('.'),
+    })
+  end
 
-    if @tags.size > 0
-      return "#{filename}.tag_#{@tags.join('.')}.part#{page_counter}.#{get_tempfile_extension}"
-    else
-      return "#{filename}.part#{page_counter}.#{get_tempfile_extension}"
+  private
+  def get_remote_filename(temp_filename)
+    # Default pattern: '%{prefix}/%{tempfile_name}'
+    params = params_from_temp_filename(temp_filename)
+    params[:temp_filename] = File.basename(temp_filename)
+    params[:prefix] = @prefix
+
+    # Fill in path template, first with strftime, then with the gathered params
+    s3_path_template = params[:timestamp].strftime(@s3_path_template)
+    return s3_path_template % params
+  end
+
+  private
+  def params_from_temp_filename(filename)
+    # Temp filenames are composed of the following parts:
+    # + Prefix: 'ls.s3'
+    # + 'host_{hostname}'
+    # + 'timestamp_{timestamp}'
+    # + 'tag_[{tag1}[.{tagN}]]'
+    # + 'part{part_index}'
+    # + '{file_extension}'
+    file_extension = get_tempfile_extension
+    file_basename = File.basename(filename)
+    pattern = Regexp.new("^#{@file_prefix}\.(?:host_(?<host>[^\.]+))\.(?:timestamp_(?<timestamp>[^\.]+))\.(?:tag_(?<tag>.+))?\.(?:part(?<part_index>\\d+)).#{file_extension}$")
+    matches = pattern.match(file_basename)
+    if not matches
+        logger.error("No match found for <#{file_basename}>")
+        raise
     end
+
+    # Build params hash
+    params = {
+        :file_prefix => @file_prefix,
+        :file_extension => file_extension,
+    }
+    if matches["tag"] 
+        params[:tag] = matches["tag"]
+    end
+    params[:part_index] = matches["part_index"].to_i
+    params[:host] = matches["host"]
+    params[:timestamp] = DateTime.strptime(matches["timestamp"], '%Y-%m-%dT%H-%M-%S')
+
+    return params
+  end
+
+  private
+  def params_to_temp_filename(params)
+    file_segments = []
+    file_segments.push(params[:file_prefix])
+    file_segments.push("host_#{params[:host]}")
+    file_segments.push("timestamp_#{params[:timestamp].strftime('%Y-%m-%dT%H-%M-%S')}")
+    if params.has_key?(:tags) and params[:tags].size > 0 then
+        file_segments.push("tag_#{params[:tags]}")
+    end
+    file_segments.push("part#{params[:part_index]}")
+    file_segments.push(params[:file_extension])
+    return file_segments.join('.')
   end
 
   public
   def receive(event)
-
     @codec.encode(event)
   end
 
@@ -455,11 +524,8 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   end
 
   private
-  def delete_on_bucket(filename)
+  def delete_on_bucket(remote_filename)
     bucket = @s3.buckets[@bucket]
-
-    remote_filename = "#{@prefix}#{File.basename(filename)}"
-
     @logger.debug("S3: delete file from bucket", :remote_filename => remote_filename, :bucket => @bucket)
 
     begin
